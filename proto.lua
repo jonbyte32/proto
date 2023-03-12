@@ -5,23 +5,16 @@
 	| An efficient process scheduling library.
 --]]
 
--- TYPEDEFS
+-- typedefs
 type Function = (...any) -> (...any)
 type Process = { exec: Function, argc: number, argv: {}, status: number, next: Function, rets: {}, awaits: {}, thread: thread }
 
--- GLOBAL
+-- global data
 local RS = game:GetService("RunService")
-local REF_OK = {}
 local IS_SERVER = RS:IsServer()
 local START_INDEX = 5 - (IS_SERVER and 2 or 0)
-local load = coroutine.create
 local S0, S1, S2, S3 = "ready", "running", "done", "cancelled"
-
---|-------------------------------------|
---|                                     |
---|            PROTO LIBRARY            |
---|                                     |
---|-------------------------------------|
+local MIN_DT = 1 / 240
 
 local lib_active = false
 
@@ -38,7 +31,6 @@ local running = nil -- all running processes
 local ttotal = 0
 local ftotal = 0
 
-
 -- resumption point data
 local update_job = nil
 local points = nil
@@ -49,13 +41,12 @@ else
 end
 local pindex, psize = START_INDEX, #points
 
-
 -- fast processor
 local fast = function(ok: {}, exec: Function, argc: number, argv: {})
 	ftotal += 1 -- debug counter
 	local thread = coroutine.running()
 	while (true) do
-		if (ok == REF_OK) then
+		if (ok == threads) then
 			running[thread] = true
 			exec(table.unpack(argv, 1, argc))
 			table.insert(fthreads, thread)
@@ -70,7 +61,7 @@ local main = function(ok: {}, proc: Process): nil
 	ttotal += 1 -- debug counter
 	local thread = coroutine.running()
 	while (true) do
-		if (ok == REF_OK) then
+		if (ok == threads) then
 			-- load
 			running[thread] = true
 			proc.status = S1
@@ -109,7 +100,7 @@ local proto = {}
 	Returns the new process.
 --]=]
 function proto.create(exec: Function): Process
-	return { exec = exec, argc = 0, argv = REF_OK, status = S0, next = nil, rets = nil, awaits = { nil }, thread = nil }
+	return { exec = exec, argc = 0, argv = threads, status = S0, next = nil, rets = nil, awaits = { nil }, thread = nil }
 end
 
 --[=[
@@ -118,7 +109,7 @@ end
 --]=]
 function proto.resume(proc: Process, ...: any): Process
 	if (proc.status == S0) then -- start
-		coroutine.resume(table.remove(threads) or load(main), REF_OK, proc)
+		coroutine.resume(table.remove(threads) or coroutine.create(main), threads, proc)
 	elseif (proc.status == S1) then -- resume
 		coroutine.resume(proc.thread, ...)
 	else
@@ -134,7 +125,7 @@ end
 --]=]
 function proto.spawn(exec: Function, ...: any): Process
 	local proc = { exec = exec, argc = select('#', ...), argv = { ... }, status = S0, next = nil, rets = nil, awaits = { nil }, thread = nil }
-	coroutine.resume(table.remove(threads) or load(main), REF_OK, proc)
+	coroutine.resume(table.remove(threads) or coroutine.create(main), threads, proc)
 	return proc
 end
 
@@ -143,7 +134,7 @@ end
 	Does not support process management and therefore returns nothing.
 --]=]
 function proto.fspawn(exec: Function, argc: number?, ...: any): nil
-	coroutine.resume(table.remove(fthreads) or load(fast), REF_OK, exec, argc, { ... })
+	coroutine.resume(table.remove(fthreads) or coroutine.create(fast), threads, exec, argc, { ... })
 	return nil
 end
 
@@ -171,8 +162,8 @@ end
 		after the specified amount of seconds.
 	Returns the new process.
 --]=]
-function proto.delay(delta: number, exec: Function | Process, ...: any): Process
-	local clock = os.clock() + delta
+function proto.delay(delta: number, exec: Function, ...: any): Process
+	local clock = math.floor((os.clock() + delta) / MIN_DT) * MIN_DT
 	scheds[clock] = scheds[clock] or { nil }
 	local proc = { exec = exec, argc = select('#', ...), argv = { ... }, status = S0, next = nil, rets = nil, awaits = { nil }, thread = nil }
 	table.insert(scheds[clock], proc)
@@ -185,7 +176,7 @@ end
 	Does not support process management and therefore returns nothing.
 --]=]
 function proto.fdelay(delta: number, exec: Function, argc: number, ...: any): nil
-	local clock = os.clock() + delta
+	local clock = math.floor((os.clock() + delta) / MIN_DT) * MIN_DT
 	fscheds[clock] = fscheds[clock] or { nil }
 	table.insert(fscheds[clock], { exec, argc, { ... } })
 	return nil
@@ -264,7 +255,6 @@ function proto.chain(data: {Function}): (...any) -> Process
 	end
 end
 
-
 --[=[
 	Yields current thread until the next resumption point.
 	Returns the delta time between calling and resumption.
@@ -277,6 +267,8 @@ function proto.step(): number
 	table.insert(fdefers, { resume_yield, 2, { coroutine.running(), os.clock() } })
 	return coroutine.yield()
 end
+
+local over = 0
 
 
 -- # start/resume the internal update loop
@@ -315,29 +307,34 @@ function proto.__lib_start(alloc: number?): typeof(proto)
 	update_job = coroutine.create(function()
 		local now = nil
 		while (lib_active) do
-			points[pindex]:Wait()
-			if (not lib_active) then return nil end
-			now = os.clock()
 
+			-- await next resumption
+			local dt = points[pindex]:Wait()
+			if (not lib_active) then
+				return nil
+			end
+			
 			-- resume fast deferred processes
 			for i, proc in fdefers do
-				coroutine.resume(table.remove(fthreads) or load(fast), REF_OK, proc[1], proc[2], proc[3])
+				coroutine.resume(table.remove(fthreads) or coroutine.create(fast), threads, proc[1], proc[2], proc[3])
 				fdefers[i] = nil
 			end
 			-- resume deferred processes
 			for i, proc in defers do
 				if (proc.status == S0) then
-					coroutine.resume(table.remove(threads) or load(main), REF_OK, proc[1], proc[2], proc[3])
+					coroutine.resume(table.remove(threads) or coroutine.create(main), threads, proc)
 				end
 				defers[i] = nil
 			end
 
 			if (points[pindex] == RS.Heartbeat) then
+				now = os.clock() + dt * 0.5
+				
 				-- resume fast scheduled processes
 				for clock, procs in fscheds do
 					if (now >= clock) then
 						for _, proc in procs do
-							coroutine.resume(table.remove(fthreads) or load(fast), REF_OK, proc[1], proc[2], proc[3])
+							coroutine.resume(table.remove(fthreads) or coroutine.create(fast), threads, proc[1], proc[2], proc[3])
 						end
 						fscheds[clock] = nil
 					end
@@ -347,7 +344,7 @@ function proto.__lib_start(alloc: number?): typeof(proto)
 					if (now >= clock) then
 						for _, proc in procs do
 							if (proc.status == S0) then
-								coroutine.resume(table.remove(threads) or load(main), REF_OK, proc)
+								coroutine.resume(table.remove(threads) or coroutine.create(main), threads, proc)
 							end
 						end
 						scheds[clock] = nil
