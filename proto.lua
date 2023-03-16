@@ -1,21 +1,27 @@
+--// Proto.luau
+--// jonbyte
+--// An efficient process scheduling library.
+
+--!optimize 2
 --!nocheck
---[[
-	| Proto.luau
-	| jonbyte
-	| An efficient process scheduling library.
---]]
 
 -- typedefs
 type Function = (...any) -> (...any)
-type Process = { exec: Function, argc: number, argv: {}, status: number, next: Function, rets: {}, awaits: {}, thread: thread }
+type Process = { exec: Function, argc: number, argv: {}, status: number, rets: {}?, awaits: {}, thread: thread? }
 
--- global data
-local RS = game:GetService("RunService")
-local IS_SERVER = RS:IsServer()
-local START_INDEX = 5 - (IS_SERVER and 2 or 0)
+-- global
+local rs = game:GetService("RunService")
+local heartbeat = rs.Heartbeat
+local is_server = rs:IsServer()
+local start_index = 5 - (is_server and 2 or 0)
 local S0, S1, S2, S3 = "ready", "running", "done", "cancelled"
-local MIN_DT = 1 / 240
+local now = time()
 
+--?? used as a unique reference identifier
+--?? to ensure processor function cannot be resumed by external system
+local REF_OK = table.freeze({})
+
+--?? is library subsytems running
 local lib_active = false
 
 -- caches
@@ -27,49 +33,50 @@ local scheds = nil -- delayed processes
 local fscheds = nil -- delayed fast processes
 local running = nil -- all running processes
 
--- debug
-local ttotal = 0
-local ftotal = 0
+-- debug counters
+local ttotal = 0 -- total allocated threads
+local ftotal = 0 -- total fast allocated threads
 
--- resumption point data
+-- scheduling data
 local update_job = nil
 local points = nil
-if (IS_SERVER) then
-	points = { RS.PreAnimation, RS.Stepped, RS.PreSimulation, RS.Heartbeat, RS.PostSimulation }
+if (is_server) then
+	points = table.freeze({ rs.PreAnimation, rs.Stepped, rs.PreSimulation, heartbeat, rs.PostSimulation })
 else
-	points = { RS.RenderStepped, RS.PreRender, RS.PreAnimation, RS.Stepped, RS.PreSimulation, RS.Heartbeat, RS.PostSimulation }
+	points = table.freeze({ rs.RenderStepped, rs.PreRender, rs.PreAnimation, rs.Stepped, rs.PreSimulation, heartbeat, rs.PostSimulation })
 end
-local pindex, psize = START_INDEX, #points
+local pindex, psize = start_index, #points
 
 -- fast processor
-local fast = function(ok: {}, exec: Function, argc: number, argv: {})
+local fast = function(ok: {}, exec: Function, argc: number, argv: {}): nil
 	ftotal += 1 -- debug counter
 	local thread = coroutine.running()
 	while (true) do
-		if (ok == threads) then
+		if (ok == REF_OK) then
 			running[thread] = true
-			exec(table.unpack(argv, 1, argc))
+			ok = if argc == 0 then exec() else exec(table.unpack(argv, 1, argc))
 			table.insert(fthreads, thread)
 			running[thread] = nil
 		end
 		ok, exec, argc, argv = coroutine.yield()
 	end
+	return nil
 end
 
 -- default processor
 local main = function(ok: {}, proc: Process): nil
 	ttotal += 1 -- debug counter
 	local thread = coroutine.running()
+	local rets, rets_n = nil, nil
 	while (true) do
-		if (ok == threads) then
+		if (ok == REF_OK) then
 			-- load
 			running[thread] = true
 			proc.status = S1
 			proc.thread = thread
 
 			-- execute process
-			local rets = { proc.exec(table.unpack(proc.argv, 1, proc.argc)) }
-			local rets_n = nil
+			rets = if proc.argc == 0 then { proc.exec() } else { proc.exec(table.unpack(proc.argv, 1, proc.argc)) }
 
 			-- resume awaits
 			if (#proc.awaits > 0) then
@@ -92,6 +99,65 @@ local main = function(ok: {}, proc: Process): nil
 	return nil
 end
 
+-- internal update loop
+local update = function(): nil
+	local proc, dt = nil, nil
+	while (lib_active) do
+
+		-- await next resumption
+		dt = points[pindex]:Wait()
+		if (not lib_active) then
+			return nil
+		end
+
+		-- resume fast deferred processes
+		for i = 1, #fdefers do
+			proc = fdefers[i]
+			coroutine.resume(table.remove(fthreads) or coroutine.create(fast), REF_OK, proc[1], proc[2], proc[3])
+			fdefers[i] = nil
+		end
+
+		-- resume deferred processes
+		for i = 1, #defers do
+			proc = defers[i]
+			if (proc.status == S0) then
+				coroutine.resume(table.remove(threads) or coroutine.create(main), REF_OK, proc)
+			end
+			defers[i] = nil
+		end
+
+		if (points[pindex] == heartbeat) then
+			now = time()
+
+			-- resume fast scheduled processes
+			for clock, procs in fscheds do
+				if (now >= clock) then
+					for i = 1, #procs do
+						proc = procs[i]
+						coroutine.resume(table.remove(fthreads) or coroutine.create(fast), REF_OK, proc[1], proc[2], proc[3])
+					end
+					fscheds[clock] = nil
+				end
+			end
+			-- resume scheduled processes
+			for clock, procs in scheds do
+				if (now >= clock) then
+					for i = 1, #procs do
+						proc = procs[i]
+						if (proc.status == S0) then
+							coroutine.resume(table.remove(threads) or coroutine.create(main), REF_OK, proc)
+						end
+					end
+					scheds[clock] = nil
+				end
+			end
+		end
+
+		pindex = pindex < psize and pindex + 1 or 1
+	end
+	return nil
+end
+
 
 local proto = {}
 
@@ -100,7 +166,7 @@ local proto = {}
 	Returns the new process.
 --]=]
 function proto.create(exec: Function): Process
-	return { exec = exec, argc = 0, argv = threads, status = S0, next = nil, rets = nil, awaits = { nil }, thread = nil }
+	return { exec = exec, argc = 0, argv = threads, status = S0, rets = nil, awaits = { nil }, thread = nil }
 end
 
 --[=[
@@ -124,8 +190,8 @@ end
 	Returns the new process.
 --]=]
 function proto.spawn(exec: Function, ...: any): Process
-	local proc = { exec = exec, argc = select('#', ...), argv = { ... }, status = S0, next = nil, rets = nil, awaits = { nil }, thread = nil }
-	coroutine.resume(table.remove(threads) or coroutine.create(main), threads, proc)
+	local proc = { exec = exec, argc = select('#', ...), argv = { ... }, status = S0, rets = nil, awaits = { nil }, thread = nil }
+	coroutine.resume(table.remove(threads) or coroutine.create(main), REF_OK, proc)
 	return proc
 end
 
@@ -134,7 +200,7 @@ end
 	Does not support process management and therefore returns nothing.
 --]=]
 function proto.fspawn(exec: Function, argc: number?, ...: any): nil
-	coroutine.resume(table.remove(fthreads) or coroutine.create(fast), threads, exec, argc, { ... })
+	coroutine.resume(table.remove(fthreads) or coroutine.create(fast), REF_OK, exec, argc or 0, { ... })
 	return nil
 end
 
@@ -143,7 +209,7 @@ end
 	Returns the new process.
 --]=]
 function proto.defer(exec: Function | Process, ...: any): Process
-	local proc = { exec = exec, argc = select('#', ...), argv = { ... }, status = S0, next = nil, rets = nil, awaits = { nil }, thread = nil }
+	local proc = { exec = exec, argc = select('#', ...), argv = { ... }, status = S0, rets = nil, awaits = { nil }, thread = nil }
 	table.insert(defers, proc)
 	return proc
 end
@@ -153,7 +219,7 @@ end
 	Does not support process management and therefore returns nothing.
 --]=]
 function proto.fdefer(exec: Function, argc: number?, ...: any): nil
-	table.insert(fdefers, { exec, argc, { ... } })
+	table.insert(fdefers, { exec, argc or 0, { ... } })
 	return nil
 end
 
@@ -162,10 +228,10 @@ end
 		after the specified amount of seconds.
 	Returns the new process.
 --]=]
-function proto.delay(delta: number, exec: Function, ...: any): Process
-	local clock = math.floor((os.clock() + delta) / MIN_DT) * MIN_DT
+function proto.delay(clock: number, exec: Function, ...: any): Process
+	clock = now + clock
 	scheds[clock] = scheds[clock] or { nil }
-	local proc = { exec = exec, argc = select('#', ...), argv = { ... }, status = S0, next = nil, rets = nil, awaits = { nil }, thread = nil }
+	local proc = { exec = exec, argc = select('#', ...), argv = { ... }, status = S0, rets = nil, awaits = { nil }, thread = nil }
 	table.insert(scheds[clock], proc)
 	return proc
 end
@@ -175,10 +241,10 @@ end
 		after the specified amount of seconds.
 	Does not support process management and therefore returns nothing.
 --]=]
-function proto.fdelay(delta: number, exec: Function, argc: number, ...: any): nil
-	local clock = math.floor((os.clock() + delta) / MIN_DT) * MIN_DT
+function proto.fdelay(clock: number, exec: Function, argc: number?, ...: any): nil
+	clock = now + clock
 	fscheds[clock] = fscheds[clock] or { nil }
-	table.insert(fscheds[clock], { exec, argc, { ... } })
+	table.insert(fscheds[clock], { exec, argc or 0, { ... } })
 	return nil
 end
 
@@ -220,7 +286,7 @@ function proto.cancel(proc: Process): nil
 		ttotal -= 1
 		proc.status = S3
 		running[proc.thread] = nil
-		proc.thread = nil :: any
+		proc.thread = nil
 	elseif (proc.status == S0) then
 		proc.status = S3
 	else
@@ -268,9 +334,6 @@ function proto.step(): number
 	return coroutine.yield()
 end
 
-local over = 0
-
-
 -- # start/resume the internal update loop
 function proto.__lib_start(alloc: number?): typeof(proto)
 	if (lib_active) then
@@ -304,57 +367,7 @@ function proto.__lib_start(alloc: number?): typeof(proto)
 	ftotal = alloc
 
 	-- internal update loop
-	update_job = coroutine.create(function()
-		local now = nil
-		while (lib_active) do
-
-			-- await next resumption
-			local dt = points[pindex]:Wait()
-			if (not lib_active) then
-				return nil
-			end
-			
-			-- resume fast deferred processes
-			for i, proc in fdefers do
-				coroutine.resume(table.remove(fthreads) or coroutine.create(fast), threads, proc[1], proc[2], proc[3])
-				fdefers[i] = nil
-			end
-			-- resume deferred processes
-			for i, proc in defers do
-				if (proc.status == S0) then
-					coroutine.resume(table.remove(threads) or coroutine.create(main), threads, proc)
-				end
-				defers[i] = nil
-			end
-
-			if (points[pindex] == RS.Heartbeat) then
-				now = os.clock() + dt * 0.5
-				
-				-- resume fast scheduled processes
-				for clock, procs in fscheds do
-					if (now >= clock) then
-						for _, proc in procs do
-							coroutine.resume(table.remove(fthreads) or coroutine.create(fast), threads, proc[1], proc[2], proc[3])
-						end
-						fscheds[clock] = nil
-					end
-				end
-				-- resume scheduled processes
-				for clock, procs in scheds do
-					if (now >= clock) then
-						for _, proc in procs do
-							if (proc.status == S0) then
-								coroutine.resume(table.remove(threads) or coroutine.create(main), threads, proc)
-							end
-						end
-						scheds[clock] = nil
-					end
-				end
-			end
-
-			pindex = pindex < psize and pindex + 1 or 1
-		end
-	end)
+	update_job = coroutine.create(update)
 	coroutine.resume(update_job)
 
 	return proto
@@ -396,35 +409,8 @@ function proto.__lib_close(): typeof(proto)
 	fscheds = nil
 	running = nil
 	
-	pindex = START_INDEX -- will start on heartbeat
+	pindex = start_index -- will start on heartbeat
 	return proto
-end
-
-function proto.__debug_info(): {}
-	if (not lib_active) then
-		warn("cannot get debug info; proto is not active")
-		return nil :: any
-	end
-	
-	local data = {}
-	data.allocated_threads = ttotal
-	data.ready_threads = #threads
-	data.allocated_fthreads = ftotal
-	data.ready_fthreads = #fthreads
-	local count = 0
-	for _ in running do count += 1 end
-	data.running_count = count
-	data.running_fast_count = ftotal - #fthreads
-	data.todo_defers = #defers
-	data.todo_fdefers = #fdefers
-	count = 0
-	for _, v in scheds do count += #v end
-	data.todo_scheds = count
-	count = 0
-	for _, v in fscheds do count += #v end
-	data.todo_fscheds = count
-	
-	return data
 end
 
 function proto.__debug_log(): nil
@@ -437,7 +423,7 @@ function proto.__debug_log(): nil
 	warn()
 	local count = 0
 	for _ in running do count += 1 end
-	warn(`running proceses : {count}`)
+	warn(`running proceses : {count - (ftotal - #fthreads)}`)
 	warn(`running fast processes : {ftotal - #fthreads}`)
 	warn()
 	warn(`deferred processes : {#defers}`)
