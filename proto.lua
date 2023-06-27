@@ -1,443 +1,603 @@
---// Proto.luau
---// jonbyte
---// An efficient process scheduling library.
+-- proto :: scheduling library
+-- jonbyte, 2023
 
---!optimize 2
---!nocheck
-
--- typedefs
-type Function = (...any) -> (...any)
-type Process = { exec: Function, argc: number, argv: {}, status: number, rets: {}?, awaits: {}, thread: thread? }
-
--- global
-local rs = game:GetService("RunService")
-local heartbeat = rs.Heartbeat
-local is_server = rs:IsServer()
-local start_index = 5 - (is_server and 2 or 0)
-local S0, S1, S2, S3 = "ready", "running", "done", "cancelled"
-local now = time()
-
---?? used as a unique reference identifier
---?? to ensure processor function cannot be resumed by external system
-local REF_OK = table.freeze({})
-
---?? is library subsytems running
-local lib_active = false
-
--- caches
-local threads = nil -- allocated ready threads
-local fthreads = nil -- allocated ready fast threads
-local defers = nil -- deferred processes
-local fdefers = nil -- deferred fast processes
-local scheds = nil -- delayed processes
-local fscheds = nil -- delayed fast processes
-local running = nil -- all running processes
-
--- debug counters
-local ttotal = 0 -- total allocated threads
-local ftotal = 0 -- total fast allocated threads
-
--- scheduling data
-local update_job = nil
-local points = nil
-if (is_server) then
-	points = table.freeze({ rs.PreAnimation, rs.Stepped, rs.PreSimulation, heartbeat, rs.PostSimulation })
-else
-	points = table.freeze({ rs.RenderStepped, rs.PreRender, rs.PreAnimation, rs.Stepped, rs.PreSimulation, heartbeat, rs.PostSimulation })
-end
-local pindex, psize = start_index, #points
-
--- fast processor
-local fast = function(ok: {}, exec: Function, argc: number, argv: {}): nil
-	ftotal += 1 -- debug counter
-	local thread = coroutine.running()
-	while (true) do
-		if (ok == REF_OK) then
-			running[thread] = true
-			ok = if argc == 0 then exec() else exec(table.unpack(argv, 1, argc))
-			table.insert(fthreads, thread)
-			running[thread] = nil
-		end
-		ok, exec, argc, argv = coroutine.yield()
-	end
-	return nil
-end
-
--- default processor
-local main = function(ok: {}, proc: Process): nil
-	ttotal += 1 -- debug counter
-	local thread = coroutine.running()
-	local rets, rets_n = nil, nil
-	while (true) do
-		if (ok == REF_OK) then
-			-- load
-			running[thread] = true
-			proc.status = S1
-			proc.thread = thread
-
-			-- execute process
-			rets = if proc.argc == 0 then { proc.exec() } else { proc.exec(table.unpack(proc.argv, 1, proc.argc)) }
-
-			-- resume awaits
-			if (#proc.awaits > 0) then
-				rets_n = table.maxn(rets)
-				for _, th in proc.awaits do
-					coroutine.resume(th, table.unpack(rets, 1, rets_n))
-				end
-				table.clear(proc.awaits)
-			end
-
-			-- done
-			running[thread] = nil
-			proc.status = S2
-			proc.thread = nil :: any
-			proc.rets = rets
-			table.insert(threads, thread)
-		end
-		ok, proc = coroutine.yield()
-	end
-	return nil
-end
-
--- internal update loop
-local update = function(): nil
-	local proc, dt = nil, nil
-	while (lib_active) do
-
-		-- await next resumption
-		dt = points[pindex]:Wait()
-		if (not lib_active) then
-			return nil
-		end
-
-		-- resume fast deferred processes
-		for i = 1, #fdefers do
-			proc = fdefers[i]
-			coroutine.resume(table.remove(fthreads) or coroutine.create(fast), REF_OK, proc[1], proc[2], proc[3])
-			fdefers[i] = nil
-		end
-
-		-- resume deferred processes
-		for i = 1, #defers do
-			proc = defers[i]
-			if (proc.status == S0) then
-				coroutine.resume(table.remove(threads) or coroutine.create(main), REF_OK, proc)
-			end
-			defers[i] = nil
-		end
-
-		if (points[pindex] == heartbeat) then
-			now = time()
-
-			-- resume fast scheduled processes
-			for clock, procs in fscheds do
-				if (now >= clock) then
-					for i = 1, #procs do
-						proc = procs[i]
-						coroutine.resume(table.remove(fthreads) or coroutine.create(fast), REF_OK, proc[1], proc[2], proc[3])
-					end
-					fscheds[clock] = nil
-				end
-			end
-			-- resume scheduled processes
-			for clock, procs in scheds do
-				if (now >= clock) then
-					for i = 1, #procs do
-						proc = procs[i]
-						if (proc.status == S0) then
-							coroutine.resume(table.remove(threads) or coroutine.create(main), REF_OK, proc)
-						end
-					end
-					scheds[clock] = nil
-				end
-			end
-		end
-
-		pindex = pindex < psize and pindex + 1 or 1
-	end
-	return nil
-end
-
+--!nolint BuiltinGlobalWrite
 
 local proto = {}
+local DEBUG = true
 
---[=[
-	Allocate a new process which can be later run.
-	Returns the new process.
---]=]
-function proto.create(exec: Function): Process
-	return { exec = exec, argc = 0, argv = threads, status = S0, rets = nil, awaits = { nil }, thread = nil }
+-- typedefs
+
+type Callback = (...any) -> (...any)
+type Factory<T...> = (...any) -> ((...any) -> (T...))
+type ArgPack = { [number]: any, n: number }
+
+export type Proto = typeof(proto)
+export type FProcess = {
+    _exec : Callback?,
+    _args : ArgPack?,
+    _fast : boolean?
+}
+export type Process = {
+    _status : "ready" | "active" | "done" | "cancelled",
+    _thread : thread?,
+    _data : ArgPack?,
+    _awaits : {},
+    _next : AnyProcess?,
+    await : (self: AnyProcess, timeout: number?) -> (boolean, ...any),
+    values : (self: AnyProcess) -> (...any),
+    push : (self: AnyProcess, exec: Callback) -> (Process),
+    cancel : (self: AnyProcess) -> (nil)
+} | FProcess
+export type Parent = {
+    _procs : {Child},
+    update : (self: Parent, child: Child) -> (nil),
+    [any] : any
+} & Process
+export type Child = {
+    _parent : Parent
+} & Process
+export type AnyProcess = Process & Parent & Child & FProcess
+
+-- init
+
+-- probably replace this with 'debug'/'release' feature
+if (DEBUG == false) then
+    warn = function(...: any)end
 end
 
---[=[
-	Starts or resume the execution of a process.
-	Returns the passed process.
---]=]
-function proto.resume(proc: Process, ...: any): Process
-	if (proc.status == S0) then -- start
-		coroutine.resume(table.remove(threads) or coroutine.create(main), threads, proc)
-	elseif (proc.status == S1) then -- resume
-		coroutine.resume(proc.thread, ...)
-	else
-		warn(`[proto.spawn_proc]: cannot start or resume a terminated process`)
-		return nil :: any
-	end
-	return proc
+-- config
+
+local REF_OK = {}
+local REF_PROCESS= {}
+local REF_PARENT = {}
+local REF_CHILD = {}
+
+local STATUS_READY = "ready"
+local STATUS_ACTIVE = "active"
+local STATUS_DONE = "done"
+local STATUS_CANCELLED = "cancelled"
+
+-- data
+
+local rs = game:GetService("RunService")
+local heartbeat = rs.Heartbeat
+local clock = time()
+
+local threads = {}
+local use = nil
+
+local fthreads = {}
+local fuse = nil
+
+local defers = {} :: { AnyProcess }
+local delays = {} :: { AnyProcess }
+local dflag = false
+
+-- processors
+
+local run = function(thread: thread, ok: {}, proc: AnyProcess, exec: Callback, ...: any): nil
+    if (ok == REF_OK) then
+        use = nil
+        
+        -- init
+        proc._thread = thread
+        proc._status = STATUS_ACTIVE
+        
+        -- execute
+        local data = table.pack(exec(...))
+        proc._data = data
+        
+        -- resume awaiting threads
+        local awaits = proc._awaits
+        for i = 1, #awaits do
+            task.defer(awaits[i], true)
+        end
+        
+        -- defer chained process
+        if (proc._next) then
+            proc._next._args = if data.n == 0 then nil else data
+            table.insert(defers, proc._next)
+        end
+        
+        -- update parent process
+        if (proc._parent) then
+            proc._parent:update(proc)
+        end
+        
+        -- cleanup
+        proc._thread = nil
+        proc._status = STATUS_DONE
+        
+        use = (use and table.insert(threads, thread) or use) or thread
+    end
+    return nil
 end
 
---[=[
-	Allocate and immediately execute a new process.
-	Returns the new process.
---]=]
-function proto.spawn(exec: Function, ...: any): Process
-	local proc = { exec = exec, argc = select('#', ...), argv = { ... }, status = S0, rets = nil, awaits = { nil }, thread = nil }
-	coroutine.resume(table.remove(threads) or coroutine.create(main), REF_OK, proc)
-	return proc
+local main = function(...: any): nil
+    local thread = coroutine.running()
+    run(thread, ...)
+    while true do
+        run(thread, coroutine.yield())
+    end
+    return nil
 end
 
---[=[
-	Allocate and immediately execute a new FAST process
-	Does not support process management and therefore returns nothing.
---]=]
-function proto.fspawn(exec: Function, argc: number?, ...: any): nil
-	coroutine.resume(table.remove(fthreads) or coroutine.create(fast), REF_OK, exec, argc or 0, { ... })
-	return nil
+local fast = function(ok: {}, exec: Callback, args: ArgPack?): nil
+    local thread = coroutine.running()
+    while true do
+        if (ok == REF_OK) then
+            fuse = nil
+            if (not args) then
+                exec()
+            else
+                exec(table.unpack(args, 1, args.n))
+            end
+            fuse = (fuse and table.insert(fthreads, thread) or fuse) or thread
+        end
+        ok, exec, args = coroutine.yield()
+    end
 end
 
---[=[
-	Allocate and schedule a new process to execute at the next resumption point.
-	Returns the new process.
---]=]
-function proto.defer(exec: Function | Process, ...: any): Process
-	local proc = { exec = exec, argc = select('#', ...), argv = { ... }, status = S0, rets = nil, awaits = { nil }, thread = nil }
-	table.insert(defers, proc)
-	return proc
+-- methods
+
+local await_timeout = function(cache: {thread}, thread: thread): nil
+    local index = table.find(cache, thread)
+    if (index) then
+        table.remove(cache, index)
+        coroutine.resume(thread, nil)
+    end
+    return nil
 end
 
---[=[
-	Allocate and schedule a new FAST process to execute at the next resumption point.
-	Does not support process management and therefore returns nothing.
---]=]
-function proto.fdefer(exec: Function, argc: number?, ...: any): nil
-	table.insert(fdefers, { exec, argc or 0, { ... } })
-	return nil
+local function await(self: AnyProcess, timeout: number?): (string?, ...any)
+    local status = self._status
+    local thread = coroutine.running()
+    local ok = nil
+    if (status == STATUS_READY or status == STATUS_ACTIVE) then
+        table.insert(self._awaits, thread)
+        local job = nil
+        if (timeout) then
+            job = proto.fdelay(timeout, await_timeout, self._awaits, thread)
+        end
+        ok = coroutine.yield()
+        if (ok == nil) then
+            return nil -- timed out & timeout process already ran so no need to cancel
+        end
+        if (job) then
+            job._status = STATUS_CANCELLED -- cancel timeout
+        end
+    end
+    if (ok or status == STATUS_DONE) then
+        return STATUS_DONE, table.unpack(self._data, 1, self._data.n)
+    else
+        return STATUS_CANCELLED, nil
+    end
+end
+proto.await = await
+
+local function values(self: AnyProcess, timeout: number?): (...any)
+    return select(2, self:await(timeout))
+end
+proto.values = values
+
+local function status(self: AnyProcess | thread): string?
+    if (type(self) == "table") then
+        return self._status
+    elseif (type(self) == "thread") then
+        return coroutine.status(self)
+    end
+    warn(`arg1 expected type 'Process | thread' got type '{typeof(self)}'`) 
+    return nil
+end
+proto.status = status
+
+local function cancel(self: AnyProcess | thread): nil
+    if (type(self) == "table") then
+        local stat = self._status
+        if (stat == STATUS_READY or stat == STATUS_ACTIVE) then
+            -- resume awaits
+            local awaits = self._awaits
+            for i = 1, #awaits do
+                task.defer(awaits[i], false)
+            end
+            -- cancel chain
+            if (self._next) then
+                proto.cancel(self._next)
+            end
+            if (stat == STATUS_ACTIVE) then
+                -- close thread
+                coroutine.close(self._thread)
+            end
+        else
+            warn(`cannot cancel a process with status '{stat}'`)
+            return nil
+        end
+        self._status = STATUS_CANCELLED
+    elseif (type(self) == "thread") then
+        coroutine.close(self)
+    else
+        warn(`arg1 expected type 'Process | thread' got type '{typeof(self)}'`) 
+    end
+    return nil
+end
+proto.cancel = cancel
+
+local function push(self: AnyProcess, exec: Callback): Process?
+    local stat = self._status
+    if (stat == STATUS_READY or stat == STATUS_ACTIVE) then
+        self._next = {
+            _status = STATUS_READY, _thread = nil, _data = nil, _awaits = {}, _next = nil, _exec = exec,
+            await = await, values = values, push = push, status = status, cancel = cancel
+        }
+        return self._next
+    end
+    if (stat == STATUS_DONE) then
+        return proto.spawn(exec, table.unpack(self._data, 1, self._data.n)) :: Process
+    end
+    if (stat == STATUS_CANCELLED) then
+        return { _status = STATUS_CANCELLED }
+    end
+    return nil
+end
+proto.push = push
+
+-- spawners
+
+function proto.create(exec: Callback): Process
+    return {
+        _status = STATUS_READY, _thread = nil, _data = nil, _awaits = {}, _next = nil, _exec = exec,
+        await = await, values = values, push = push, status = status, cancel = cancel
+    }
 end
 
---[=[
-	Allocate and schedule a new process to execute on the next heartbeat
-		after the specified amount of seconds.
-	Returns the new process.
---]=]
-function proto.delay(clock: number, exec: Function, ...: any): Process
-	clock = now + clock
-	scheds[clock] = scheds[clock] or { nil }
-	local proc = { exec = exec, argc = select('#', ...), argv = { ... }, status = S0, rets = nil, awaits = { nil }, thread = nil }
-	table.insert(scheds[clock], proc)
-	return proc
+function proto.spawn(exec: Callback | AnyProcess | thread, ...: any): (Process | thread)
+    if (type(exec) == "function") then
+        -- spawn a new process
+        local proc = {
+            _status = STATUS_READY, _thread = nil, _data = nil, _awaits = {}, _next = nil,
+            await = await, values = values, push = push, status = status, cancel = cancel
+        }
+        coroutine.resume(use or table.remove(threads) or coroutine.create(main), REF_OK, proc, exec, ...)
+        return proc :: Process
+    end
+    if (type(exec) == "table") then
+        -- resume an existing process
+        if (exec._status == STATUS_ACTIVE) then
+            -- if active we know it is yielding at this point
+            coroutine.resume(exec._thread :: thread, ...)
+        elseif (exec._status == STATUS_READY) then
+            coroutine.resume(use or table.remove(threads) or coroutine.create(main), REF_OK, exec, exec._exec, ...)
+        else
+            warn(`cannot spawn process with status '{exec._status}'`)
+        end
+        return exec :: Process
+    end
+    if (type(exec) == "thread") then
+        -- resume an existing raw thread
+        local status = coroutine.status(exec)
+        if (status == "suspended") then
+            coroutine.resume(exec :: thread, ...)
+        else
+            warn(`cannot resume thread with status '{status}'`)
+        end
+        return exec :: thread
+    end
+    warn(`arg1 expected type 'Function | Process | thread' got type '{typeof(exec)}'`)
+    return exec
 end
 
---[=[
-	Allocate and schedule a new FAST process to execute on the next heartbeat
-		after the specified amount of seconds.
-	Does not support process management and therefore returns nothing.
---]=]
-function proto.fdelay(clock: number, exec: Function, argc: number?, ...: any): nil
-	clock = now + clock
-	fscheds[clock] = fscheds[clock] or { nil }
-	table.insert(fscheds[clock], { exec, argc or 0, { ... } })
-	return nil
+function proto.fspawn(exec: Callback, ...: any): thread
+    local argc = select('#', ...)
+    local thread = fuse or table.remove(fthreads) or coroutine.create(fast)
+    coroutine.resume(thread, REF_OK, exec, if argc == 0 then nil else { n = argc, ... })
+    return thread
 end
 
---[=[
-	Yield current thread until process has finished or an optional timeout occurs.
-	Returns
-		[1] boolean : true if process finished normally
-					: false if cancelled or timeout happens
-		[2] ... : the return values of the process or nil
---]=]
-function proto.await(proc: Process, timeout: number?): (boolean, ...any)
-	local status = proc.status
-	if (status == S0 or status == S1) then
-		local thread = coroutine.running()
-		if (timeout) then
-			proto.fdelay(timeout, coroutine.resume, 3, thread, false, nil)
-		end
-		table.insert(proc.awaits, thread)
-		return coroutine.yield()
-	else
-		if (proc.status == S2) then
-			return true, table.unpack(proc.rets, 1, table.maxn(proc.rets))
-		else
-			return false, nil
-		end
-	end
+function proto.defer(exec: Callback | AnyProcess | thread, ...: any): (Process | thread)?
+    if (type(exec) == "function") then
+        -- defer a new process
+        local proc = {
+            _status = STATUS_READY, _thread = nil, _data = nil, _awaits = {}, _next = nil,
+            _exec = exec, _args = select('#', ...) > 0 and table.pack(...) or nil, _fast = false,
+            await = await, values = values, push = push, status = status, cancel = cancel
+        }
+        table.insert(defers, proc)
+        return proc
+    elseif (type(exec) == "table") then
+        -- defer resumption of an existing process
+        --  using 'proto.spawn' as executor to account for
+        -- different statuses on resumption
+        if (exec._status == STATUS_ACTIVE) then
+            return proto.defer(proto.spawn, exec._thread, ...)
+        elseif (exec._status == STATUS_READY) then
+            return proto.defer(proto.spawn, exec, ...)
+        else
+            warn(`cannot defer process with status '{exec._status}'`)
+            return nil
+        end
+    elseif (type(exec) == "thread") then
+        -- defer resumption of an existing raw thread
+        return proto.defer(coroutine.resume, exec, ...)
+    end
+    warn(`arg1 expected type 'Function | Process | thread' got type '{typeof(exec)}'`)
+    return nil
 end
 
-function proto.get(proc: Process, timeout: number?)
-	return select(2, proto.await(proc, timeout))
+function proto.fdefer(exec: Callback, ...: any): Process
+    -- defer a new fast process
+    local proc = {
+        _status = STATUS_READY, _exec = exec, _args = select('#', ...) > 0 and table.pack(...) or nil, _fast = true
+    }
+    table.insert(defers, proc)
+    return proc :: any
 end
 
---[=[
-	Prevents or stops the execution of a process.
---]=]
-function proto.cancel(proc: Process): nil
-	if (proc.status == S1) then
-		coroutine.close(proc.thread)
-		ttotal -= 1
-		proc.status = S3
-		running[proc.thread] = nil
-		proc.thread = nil
-	elseif (proc.status == S0) then
-		proc.status = S3
-	else
-		warn("[proto.cancel]: cannot cancel a terminated process")
-	end
-	return nil
+function proto.delay(seconds: number, exec: Callback | AnyProcess | thread, ...: any): (Process | thread)?
+    if (type(exec) == "function") then
+        -- delay a new process
+        local proc = {
+            _status = STATUS_READY, _thread = nil, _data = nil, _awaits = {}, _next = nil,
+            _exec = exec, _args = select('#', ...) > 0 and table.pack(...) or nil, _fast = false, _time = clock + seconds + 1e-3,
+            await = await, values = values, push = push, status = status, cancel = cancel
+        }
+        if (delays[1] and delays[#delays]._time > clock + seconds + 1e-3) then
+            dflag = true -- re-sort needed
+        end
+        table.insert(delays, proc)
+        return proc
+    elseif (type(exec) == "table") then
+        -- delay an existing process
+        return proto.delay(seconds, proto.spawn, exec._thread, ...)
+    elseif (type(exec) == "thread") then
+        -- delay an existing raw thread
+        return proto.delay(seconds, proto.spawn, exec, ...)
+    end
+    warn(`arg1 expected type 'Function | Process | thread' got type '{typeof(exec)}'`)
+    return nil
 end
 
---[=[
-	Wraps the execution of a function as a process.
-	Returns the generator function.
---]=]
-function proto.wrap(exec: Function): (...any) -> Process
-	return function(...: any)
-		return proto.spawn(exec, ...)
-	end
+function proto.fdelay(seconds: number, exec: Callback, ...: any): Process
+    -- delay a new fast process
+    if (delays[1] and delays[#delays]._time > clock + seconds + 1e-3) then
+        dflag = true -- re-sort needed
+    end
+    local proc = {
+        _status = STATUS_READY, _exec = exec, _args = select('#', ...) > 0 and table.pack(...) or nil, _fast = true, _time = clock + seconds + 1e-3
+    }
+    table.insert(delays, proc)
+    return proc :: any
 end
 
---[=[
-	Wraps the execution of a sequence of functions as a single process.
-	Returns the generator function.
---]=]
-function proto.chain(data: {Function}): (...any) -> Process
-	return function(...: any)
-		return proto.spawn(function(...)
-			local argc, argv = select('#', ...), { ... }
-			for _, exec in data do
-				argv = { exec(table.unpack(argv, 1, argc)) }
-				argc = table.maxn(argv)
-			end
-		end, ...)
-	end
+function proto.parent(exec: Callback, update: Callback, data: {}?, execs: {Callback}, ...: any): Parent
+    local proc = {
+        _procs = {}, _status = STATUS_READY, _thread = nil, _data = nil, _awaits = {}, _next = nil,
+        update = update, await = await, values = values, push = push, status = status, cancel = cancel
+    }
+    if (data) then
+        for k, v in data do proc[k] = v end
+    end
+    coroutine.resume(use or table.remove(threads) or coroutine.create(main), REF_OK, proc, exec, proc)
+    for i = 1, #execs do
+        if (proc._status == STATUS_ACTIVE) then
+            proc._procs[i] = proto.child(proc, execs[i], ...)
+        end
+    end
+    return proc
 end
 
---[=[
-	Yields current thread until the next resumption point.
-	Returns the delta time between calling and resumption.
---]=]
-local resume_yield = function(thread: thread, clock: number)
-	return coroutine.resume(thread, os.clock() - clock)
+function proto.child(parent: Parent, exec: Callback, ...: any): Child
+    local proc = {
+        _parent = parent, _status = STATUS_READY, _thread = nil, _data = nil, _awaits = {}, _next = nil,
+        await = await, values = values, push = push, status = status, cancel = cancel
+    }
+    coroutine.resume(use or table.remove(threads) or coroutine.create(main), REF_OK, proc, exec, ...)
+    return proc
 end
 
-function proto.step(): number
-	table.insert(fdefers, { resume_yield, 2, { coroutine.running(), os.clock() } })
-	return coroutine.yield()
+-- factories
+
+function proto.wrap(exec: Callback, fast: boolean?): Factory<Process>
+    return function(...: any)
+        return proto.spawn(exec, ...)
+    end
 end
 
--- # start/resume the internal update loop
-function proto.__lib_start(alloc: number?): typeof(proto)
-	if (lib_active) then
-		warn("cannot start; proto is already active")
-		return proto
-	end
-	lib_active = true
-	
-	-- initial allocation
-	local alloc = alloc or 0
-	threads = table.create(alloc)
-	fthreads = table.create(alloc)
-	defers = table.create(alloc)
-	fdefers = table.create(alloc)
-	scheds = {}
-	fscheds = {}
-	running = {}
-
-	local thread = nil
-	for _ = 1, alloc do
-		-- normal threads
-		thread = coroutine.create(main)
-		coroutine.resume(thread)
-		table.insert(threads, thread)
-		-- fast threads
-		thread = coroutine.create(fast)
-		coroutine.resume(thread)
-		table.insert(fthreads, thread)
-	end
-	ttotal = alloc
-	ftotal = alloc
-
-	-- internal update loop
-	update_job = coroutine.create(update)
-	coroutine.resume(update_job)
-
-	return proto
+local chain = function(execs: {Callback}, ...: any): (...any)
+    local values = table.pack(...)
+    for i = 1, #execs do
+        values = table.pack(execs[i](table.unpack(values, 1, values.n)))
+    end
+    return table.unpack(values, 1, values.n)
 end
 
--- # stop the internal update loop and clear all jobs
-function proto.__lib_close(): typeof(proto)
-	if (not lib_active) then
-		warn("cannot close; proto is not active")
-		return proto
-	end
-	lib_active = false
-	
-	-- cleanup running processes
-	for thread, proc in running do
-		coroutine.close(thread)
-		if (type(proc) == "table") then
-			proc.status = S3
-			proc.thread = nil
-		end
-	end
-	
-	-- cleanup ready threads
-	for _, thread in threads do
-		coroutine.close(thread)
-	end
-	for _, thread in fthreads do
-		coroutine.close(thread)
-	end
-	
-	-- wipe memory
-	threads = nil
-	ttotal = 0
-	fthreads = nil
-	ftotal = 0
-	defers = nil
-	fdefers = nil
-	scheds = nil
-	fscheds = nil
-	running = nil
-	
-	pindex = start_index -- will start on heartbeat
-	return proto
+function proto.chain(execs: {Callback}): Factory<Process>
+    return function(...: any)
+        return proto.spawn(chain, execs, ...)
+    end
 end
 
-function proto.__debug_log(): nil
-	warn()
-	warn("-----------------------------------------------")
-	warn(`allocated threads : {ttotal}`)
-	warn(`ready threads : {#threads}`)
-	warn(`allocated fast threads : {ftotal}`)
-	warn(`ready fast threads : {#fthreads}`)
-	warn()
-	local count = 0
-	for _ in running do count += 1 end
-	warn(`running proceses : {count - (ftotal - #fthreads)}`)
-	warn(`running fast processes : {ftotal - #fthreads}`)
-	warn()
-	warn(`deferred processes : {#defers}`)
-	warn(`deferred fast processes : {#fdefers}`)
-	warn()
-	count = 0
-	for _, v in scheds do count += #v end
-	warn(`scheduled processes : {count}`)
-	count = 0
-	for _, v in fscheds do count += #v end
-	warn(`scheduled fast processes : {#fscheds}`)
-	warn("-----------------------------------------------")
-	warn()
-	return nil
+local retry = function(count: number, delay: number?, exec: Callback, ...): (...any)
+    local values = table.pack(...)
+    for i = 1, count do
+        values = table.pack(exec(table.unpack(values, 1, values.n)))
+        if (values[1]) then
+            break
+        end
+        if (delay) then
+            task.wait(delay)
+        end
+    end
+    return table.unpack(values, 1, values.n)
 end
 
-return proto.__lib_start(16)
+function proto.retry(count: number, delay: number?, exec: Callback): Factory<Process>
+    return function(...: any)
+        return proto.spawn(retry, count, delay, exec, ...)
+    end
+end
+
+-- prefixed by _ to avoid overwriting global 'pcall'
+local _pcall = function(exec: Callback, err: Callback?, ...: any): (...any)
+    local values = table.pack(pcall(exec(...)))
+    if (not values[1] and err) then
+        return err(values[2])
+    end
+    return table.unpack(values, 1, values.n)
+end
+
+function proto.pcall(exec: Callback, err: Callback?): Factory<Process>
+    return function(...: any)
+        return proto.spawn(_pcall, err, ...)
+    end
+end
+
+local all_exec = function(self: Parent): (...any)
+    if (self.count ~= self.target) then
+        return coroutine.yield()
+    end
+end
+
+local all_update = function(self: Parent, child: Child): nil
+    self.count += 1
+    if (self.count == self.target) then
+        for _, proc in self._procs do
+            if (proc ~= child and proc._status == STATUS_ACTIVE) then
+                coroutine.close(proc._thread)
+            end
+        end
+        coroutine.resume(self._thread)
+        self._status = STATUS_DONE
+    end
+    return nil
+end
+
+function proto.all(execs: {Callback}, count: number?): Factory<Parent>
+    return function(...: any)
+        return proto.parent(all_exec, all_update, { count = 0, target = math.clamp(count or #execs, 0, #execs) }, execs, ...)
+    end
+end
+
+-- utilities
+
+-- experimental
+function proto.reset(proc: AnyProcess): nil
+    proc._status = STATUS_READY
+    return nil
+end
+
+function proto.step(frames: number?): number
+    local dt = 0
+    for i = 1, frames or 1 do
+        dt += heartbeat:Wait()
+    end
+    return dt
+end
+
+function proto.kill(): nil
+    task.defer(coroutine.close, coroutine.running())
+    coroutine.yield()
+    return nil
+end
+
+-- scheduling
+
+do
+    -- load resumption points
+    local steps = rs:IsServer()
+        and table.freeze({ rs.PreAnimation, rs.Stepped, rs.PreSimulation,
+            rs.Heartbeat, rs.PostSimulation })
+        or  table.freeze({ rs.RenderStepped, rs.PreRender, rs.PreAnimation,
+            rs.Stepped, rs.PreSimulation, rs.Heartbeat, rs.PostSimulation })
+    local hb = (table.find(steps, heartbeat) :: number) - 1
+    local index = hb
+    local size = #steps
+
+    local sort_delays = function(p1: AnyProcess, p2: AnyProcess)
+        return p1._time < p2._time
+    end
+
+    -- initialize scheduler
+    local update = function(dt)
+        debug.profilebegin("PROTO-UPDATE")
+        local proc = nil
+        local todo = defers
+        debug.profilebegin("DELAY")
+        if (index == hb) then
+            clock = time()
+            if (delays[1]) then
+                -- load delayed processes to deferred
+                if (dflag) then
+                    dflag = false
+                    table.sort(delays, sort_delays)
+                end
+                for i = 1, #delays do
+                    proc = delays[i]
+                    if (clock >= proc._time) then
+                        table.insert(todo, proc)
+                        delays[i] = nil
+                    end
+                end
+            end
+        end
+        debug.profileend()
+        debug.profilebegin("DEFER")
+        -- execute deferred processes
+        if (defers[1]) then
+            defers = {}
+            for i = 1, #todo do
+                proc = todo[i]
+                if (proc._status == STATUS_READY) then
+                    if (proc._fast) then
+                        coroutine.resume(
+                            fuse or table.remove(fthreads) or coroutine.create(fast),
+                            REF_OK, proc._exec, proc._args
+                        )
+                    else
+                        if (proc._args) then
+                            coroutine.resume(
+                                use or table.remove(threads) or coroutine.create(main),
+                                REF_OK, proc, proc._exec, table.unpack(proc._args, 1, proc._args.n)
+                            )
+                        else
+                            coroutine.resume(
+                                use or table.remove(threads) or coroutine.create(main),
+                                REF_OK, proc, proc._exec, nil
+                            )
+                        end
+                    end
+                end
+                todo[i] = nil
+            end
+        end
+        debug.profileend()
+        debug.profileend()
+        return nil
+    end
+
+    task.spawn(function()
+        while true do
+            update(steps[index + 1]:Wait())
+            index = (index + 1) % size
+        end
+        return nil
+    end)
+end
+
+-- coroutine compat
+-- local coroutine = proto
+
+proto.yield = coroutine.yield
+proto.isyieldable = coroutine.isyieldable
+proto.running = coroutine.running
+proto.resume = proto.spawn
+proto.close = proto.cancel
+
+-- tasklib compat
+-- local task = proto
+
+proto.wait = task.wait
+proto.synchronize = task.synchronize
+proto.desynchronzie = task.desynchronize
+
+return proto
